@@ -1,0 +1,513 @@
+#general
+##Loading of all modules
+module load fastqc
+module load fastqp
+module load bwa
+module load samtools
+module load bcftools
+##copy fasta sequences
+cp /filer-dg/agruppen/seq_shared/mascher/barley_pangenome_v2_ena_submission/assemblies/Igri/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta
+bwa index reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta
+##copy annotation file
+cp /filer-dg/agruppen/seq_shared/mascher/barley_pangenome_v2_gene_annotation_230220/consolidated_final/gffs/Igri.gff /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/Igri_annotated/Igri.gff
+bwa index Igri_annotated/Igri.gff
+#GBS data analysis
+cd /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/GBS
+mkdir gbs_reads
+ln -s $datadir/Sample*/*fastq.gz gbs_reads
+##allignment to Igri
+tmux
+tmux rename mapping
+ref='/filer-5/agruppen/GGR/boyny/data_analysis/awais_IgrixAlraune/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta' 
+for i in gbs_reads/*fastq.gz; do
+name=`echo $i | cut -d . -f 1` 
+bwa mem -t 10 $ref $i | samtools sort > $name.bam
+done 2> bwa.err
+#leaving and entering tmux  strg+B D
+
+##counting reads and mapping rates
+for i in gbs_reads/*.fastq.gz; do
+name=`basename $i | cut -d . -f 1`
+count=`zcat $i | wc -l`
+echo $name $count
+done > fastq_line_counts2.txt
+cat fastq_line_counts.txt | awk '{print $1,$2/4}' | sort -nk 2 > fastq_read_counts.txt
+for i in gbs_reads/*bam; do
+name=`basename $i | cut -d . -f 1`
+count=`samtools view -cq 20 $i`
+echo $name $count
+done > mapped_reads.txt
+LC_ALL=C sort fastq_read_counts.txt > tmp1
+LC_ALL=C sort mapped_reads.txt > tmp2
+join tmp1 tmp2 | awk '{print $0,$3/$2*100}' | sort -nk 4 | column -t > mapping_stats.txt
+rm -f tmp1 tmp2
+column -t mapping_stats.txt  | less -S
+##variant calling and filtering
+ls gbs_reads/*bam | sort > bam_list.txt
+tmux
+tmux rename variant_call
+ref='/filer-5/agruppen/GGR/boyny/GBS_data_analysis/awais_IgrixAlraune/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta' 
+bamlist='bam_list.txt'
+vcf='bcftools_SNP_calling_1.vcf'
+bcftools mpileup --skip-indels --fasta-ref $ref --bam-list $bamlist --min-MQ 20 --annotate AD \
+| bcftools view -i 'INFO/DP > 190' \
+| bcftools call --consensus-caller --variants-only --output $vcf
+filter='/filer-dg/agruppen/dg6/mascher/DG/mxb_course_221201/scripts/filter_vcf.zsh'
+vcf='bcftools_SNP_calling.vcf'
+fvcf='bcftools_SNP_calling_filtered.vcf'
+$filter --vcf $vcf --dphom 5 --dphet 5 --minmaf 0.05 --minpresent 0.76 --minhomp 0 > $fvcf #pro chromosom bleiben >100 Marker 
+bcftools query -l $fvcf | cut -d / -f 2 | cut -d . -f 1 > new_sample_names.txt 
+bcftools reheader -s new_sample_names.txt $fvcf > bcftools_SNP_calling_filtered_newNames.vcf
+##Read mapping
+###opening R
+module load R/4.1.1
+R
+.libPaths("/filer-dg/agruppen/dg6/mascher/DG/mxb_course_221201/Rlibs/4.1.1") 
+library("qtl") 
+library("ASMap") 
+library("utl")
+###loading files and creating crossproduct
+vcf <- 'bcftools_SNP_calling_filtered_newNames.vcf'
+ids <- read.table("new_sample_names.txt", head=F)[, 1]
+genfile <- 'bcftools_SNP_calling_geno.csv'
+founders <- c("3180508_Alraune_3_S226_L002_R1_001","3180320_M4IGRI_11_1_S46_L001_R1_001")
+samples <- setdiff(ids, founders)
+convert_vcf_to_genfile(vcf, genfile, samples, founders)
+cmd <- "sed -Ei '1{p; s/id|chr.H://g; h; d}; 2G'"
+paste(cmd, genfile) |> system()
+pheno <- 'Phenotypes.csv'
+read.cross(format="csvs", genfile=genfile, phefile=pheno, crosstype= "f2",  genotypes=c("AA","AB","BB")) -> ixa
+convert2bcsft(ixa, BC.gen=0, F.gen=2,  estimate.map=F) -> ixa
+rescalemap(ixa, 1/1e6) -> ixa
+pdf("plot_map_physical.pdf")
+plot.map(ixa, main="Physical map", ylab="Location (Mb)", horizontal = T)
+dev.off()
+###Quality control
+ixa -> ixa_physical
+#remove duplicates
+cg <- comparegeno(ixa)
+summary(cg, thresh=0.9) -> dups
+subset(ixa, ind=setdiff(samples, dups$ind2)) -> ixa
+# We remove the odd individuals with lots of missing calls.
+ntyped(ixa) |> sort() |> head(n=1) -> rm.ind
+subset(ixa, ind=setdiff(names(ntyped(ixa)), names(rm.ind))) -> ixa 
+###plots and summaries before linkage map construction
+summary(ixa) 
+summary.map(ixa) 
+plotpdf("plot_pheno.pdf")
+plotPheno(ixa, pheno.col=1, xlab="phenotypes")
+dev.off() 
+pdf("compare_geno.pdf")
+hist(cg[lower.tri(cg)], breaks=seq(0, 1, len=101), xlab="No. matching genotypes")
+dev.off()
+#look at graphical genotypes
+pdf("plot.geno.pdf")
+geno.image(ixa, col=c("white", "orange", "darkturquoise", "blue"), reorder = T) 
+dev.off()
+### linkage map construction
+mstmap.cross(ixa, id="id", bychr=T, anchor=T) -> ixa
+ixa <- mergeCross(ixa, merge=list('3H'=c("3H.1","3H.2")))
+summary.map(ixa)
+pull.map(ixa, as.table=T) -> a
+pull.map(ixa_physical, as.table=T) -> b
+merge(a, b, by=0) -> m 
+sapply(split(m, m$chr.x), function(i) with(i, cor(pos.x, pos.y, method='s'))) -> cc
+names(which(cc < 0)) -> flip.chr
+flip.order(ixa, flip.chr) -> ixa
+
+pdf("align_maps_2.pdf")
+alignCross(ixa, maps=list(ixa_physical), layout=c(1,1))
+dev.off()
+
+pdf("plot.geno.mstmap.pdf")
+geno.image(ixa, col=c("white", "orange", "darkturquoise", "blue"), reorder = T)
+dev.off()
+
+pdf("plot_map_genetic.pdf")
+plot.map(ixa, main="Genetic map", ylab="Location (cM)")
+dev.off()
+
+rescalemap(ixa_physical, 1/5) -> ixa_physical 
+pdf("plot_map_2.pdf")
+plotMap(ixa, ixa_physical)
+dev.off()
+
+ixa -> ixa_genetic
+saveRDS(ixa_genetic, file="ixa_genetic.Rds")
+###trait mapping
+pheno <- 'Phenotypes.csv'
+readRDS("ixa_genetic.Rds") -> ixa
+calc.genoprob(ixa) -> ixa
+scanone(ixa, pheno.col=1, method="mr", model="binary") -> out
+summary(out)
+pdf("pendant_awn_genetic.pdf")
+plot(out)
+dev.off()
+#permutation test
+operm <- scanone(ixa, method="mr", n.perm=1000, pheno.col=1)
+summary(operm, alpha=c(0.05, 0.2))
+pdf("plot_operm_genetic.pdf") 
+hist(as.numeric(operm))
+abline(v=summary(operm, alpha=c(0.05)), col='red')
+dev.off()
+summary(out, perms=operm, pvalues=TRUE)
+pdf("pendant_awn_threshold_genetic2.pdf")
+plot(out)
+abline(h=4.1, col='red') 
+dev.off()
+lodint(out, chr="3H", drop=2)
+out[out$lod>4.1,]
+rownames(max(out)) -> mar
+pdf("plot_pxg_genetic.pdf")
+plotPXG(ixa, pheno.col=1, marker=mar)
+dev.off()
+
+#WGS data analysis
+ #changing working directory
+cd /filer-5/agruppen/GGR/boyny/data_analysis/WGS_Igri_mutants
+#copy fasta sequences
+cp /hsm/novaseq/GGR/NOVASEQ/2023/231116_A00550_0373_AHNLFMDMXY/stein/*/*/*.fastq.gz *.fastq.gz
+##Sequence pre-processing, alignment and variant calling
+###Alraune
+####pre-processing
+fastp -i 3240826_Alraune_A_S22_L001_R1_001.fastq.gz -I 3240826_Alraune_A_S22_L001_R2_001.fastq.gz -o 3240826_Alraune_A_S22_L001_R1_001_trimmed.fastq.gz -O 3240826_Alraune_A_S22_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240834_Alraune_B_S23_L001_R1_001.fastq.gz -I 3240834_Alraune_B_S23_L001_R2_001.fastq.gz -o 3240834_Alraune_B_S23_L001_R1_001_trimmed.fastq.gz -O 3240834_Alraune_B_S23_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240842_Alraune_C_S24_L001_R1_001.fastq.gz -I 3240842_Alraune_C_S24_L001_R2_001.fastq.gz -o 3240842_Alraune_C_S24_L001_R1_001_trimmed.fastq.gz -O 3240842_Alraune_C_S24_L001_R2_001_trimmed.fastq.gz
+####sequence allignment
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240826_Alraune_A_S22_L001_R1_001_trimmed.fastq.gz 3240826_Alraune_A_S22_L001_R2_001_trimmed.fastq.gz > Alraune_A_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240834_Alraune_B_S23_L001_R1_001_trimmed.fastq.gz 3240834_Alraune_B_S23_L001_R2_001_trimmed.fastq.gz > Alraune_B_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240842_Alraune_C_S24_L001_R1_001_trimmed.fastq.gz 3240842_Alraune_C_S24_L001_R2_001_trimmed.fastq.gz > Alraune_C_whole.sam
+####merge, sort, mark duplicates
+samtools merge Alraune_A_whole.sam Alraune_B_whole.sam Alraune_C_whole.sam -o Alraune_merged.bam
+samtools fixmate -m Alraune_merged.bam Alraune_merged_fixmate.bam
+samtools sort -O bam -o Alraune_merged_fixmate_sort.bam Alraune_merged_fixmate.bam
+samtools markdup Alraune_merged_fixmate_sort.bam Alraune_merged_fixmate_sort_MD.bam
+samtools index -c Alraune_merged_fixmate_sort_MD.bam
+####identify SNPs
+bcftools mpileup --skip-indels --fasta-ref /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta Alraune_merged_fixmate_sort_MD.bam --min-MQ 30 --annotate AD | bcftools call --consensus-caller --variants-only --output Alraune.vcf
+####filtering
+#####filtering for homozygosity (1) and read depth (min 10 and max 40)
+awk 'split($10,a,":") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[1], a[2], a[3]}' Alraune.vcf > Alraune_filter1.vcf
+awk 'split($13,a,",") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[2]/(a[1]+a[2]), a[2]+a[1]}' Alraune_filter1.vcf > Alraune_filter2.vcf
+awk '$11 >= 1  && $12 >= 3 && $12 <= 20 {print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10}' Alraune_filter2.vcf > Alraune_filter3.vcf
+#####Add headers to filtered.vcf files 
+grep '^#' Alraune.vcf | cat - Alraune_filter3.vcf > tmpfile && mv tmpfile Alraune_filter3.vcf
+
+###M4IGRI_11
+#### pre-processing
+fastp -i 3240823_M4IGRI_11_11_A_S13_L001_R1_001.fastq.gz -I 3240823_M4IGRI_11_11_A_S13_L001_R2_001.fastq.gz -o 3240823_M4IGRI_11_11_A_S13_L001_R1_001_trimmed.fastq.gz -O 3240823_M4IGRI_11_11_A_S13_L001_R1_001_trimmed.fastq.gz
+fastp -i 3240831_M4IGRI_11_11_B_S14_L001_R1_001.fastq.gz -I 3240831_M4IGRI_11_11_B_S14_L001_R1_001.fastq.gz -o 3240831_M4IGRI_11_11_B_S14_L001_R1_001_trimmed.fastq.gz -O 3240831_M4IGRI_11_11_B_S14_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240839_M4IGRI_11_11_C_S15_L001_R1_001.fastq.gz -I 3240839_M4IGRI_11_11_C_S15_L001_R2_001.fastq.gz -o 3240839_M4IGRI_11_11_C_S15_L001_R1_001__trimmed.fastq.gz -O 3240839_M4IGRI_11_11_C_S15_L001_R1_001_trimmed.fastq.gz
+####sequence allignment
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240823_M4IGRI_11_11_A_S13_L001_R1_001_trimmed.fastq.gz 3240823_M4IGRI_11_11_A_S13_L001_R1_001_trimmed.fastq.gz > M4IGRI_11_A_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240831_M4IGRI_11_11_B_S14_L001_R1_001_trimmed.fastq.gz 3240831_M4IGRI_11_11_B_S14_L001_R2_001_trimmed.fastq.gz > M4IGRI_11_B_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240839_M4IGRI_11_11_C_S15_L001_R1_001__trimmed.fastq.gz 3240839_M4IGRI_11_11_C_S15_L001_R1_001_trimmed.fastq.gz > M4IGRI_11_C_whole.sam
+####merge, sort, mark duplicates
+samtools merge M4IGRI_11_A_whole.sam M4IGRI_11_B_whole.sam M4IGRI_11_C_whole.sam -o M4IGRI_11_merged.bam
+samtools fixmate -m M4IGRI_11_merged.bam M4IGRI_11_merged_fixmate.bam
+samtools sort -O bam -o M4IGRI_11_merged_fixmate_sort.bam M4IGRI_11_merged_fixmate.bam
+samtools markdup M4IGRI_11_merged_fixmate_sort.bam M4IGRI_11_merged_fixmate_sort_MD.bam
+samtools index -c M4IGRI_11_merged_fixmate_sort_MD.bam
+####identify SNPs
+bcftools mpileup --skip-indels --fasta-ref /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta M4IGRI_11_merged_fixmate_sort_MD.bam --min-MQ 30 --annotate AD | bcftools call --consensus-caller --variants-only --output M4IGRI_11.vcf
+####filtering
+#####filtering for homozygosity (1) and read depth (min 10 and max 40)
+awk 'split($10,a,":") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[1], a[2], a[3]}' M4IGRI_11.vcf > M4IGRI_11_filter1.vcf
+awk 'split($13,a,",") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[2]/(a[1]+a[2]), a[2]+a[1]}' M4IGRI_11_filter1.vcf > M4IGRI_11_filter2.vcf
+awk '$11 >= 1  && $12 >= 3 && $12 <= 20 {print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10}' M4IGRI_11_filter2.vcf > M4IGRI_11_filter3.vcf
+#####add headers
+grep '^#' M4IGRI_11.vcf | cat - M4IGRI_11_filtered.vcf > tmpfile && mv tmpfile M4IGRI_11_filtered.vcf
+
+
+###M4IGRI_10
+####pre-processing
+fastp -i 3240822_M4IGRI_10_21_2_A_S10_L001_R1_001.fastq.gz -I 3240822_M4IGRI_10_21_2_A_S10_L001_R2_001.fastq.gz -o 3240822_M4IGRI_10_21_2_A_S10_L001_R1_001_trimmed.fastq.gz -O 3240822_M4IGRI_10_21_2_A_S10_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240830_M4IGRI_10_21_2_B_S11_L001_R1_001.fastq.gz -I 3240830_M4IGRI_10_21_2_B_S11_L001_R2_001.fastq.gz -o 3240830_M4IGRI_10_21_2_B_S11_L001_R1_001_trimmed.fastq.gz -O 3240830_M4IGRI_10_21_2_B_S11_L001_R1_001_trimmed.fastq.gz
+fastp -i 3240838_M4IGRI_10_21_2_C_S12_L001_R1_001.fastq.gz -I 3240838_M4IGRI_10_21_2_C_S12_L001_R2_001.fastq.gz -o 3240838_M4IGRI_10_21_2_C_S12_L001_R1_001_trimmed.fastq.gz -O 3240838_M4IGRI_10_21_2_C_S12_L001_R1_001_trimmed.fastq.gz
+####sequence allignment
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240822_M4IGRI_10_21_2_A_S10_L001_R1_001_trimmed.fastq.gz 3240822_M4IGRI_10_21_2_A_S10_L001_R2_001_trimmed.fastq.gz > M4IGRI_10_A_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240830_M4IGRI_10_21_2_B_S11_L001_R1_001_trimmed.fastq.gz 3240830_M4IGRI_10_21_2_B_S11_L001_R1_001_trimmed.fastq.gz > M4IGRI_10_B_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240838_M4IGRI_10_21_2_C_S12_L001_R1_001_trimmed.fastq.gz 3240838_M4IGRI_10_21_2_C_S12_L001_R1_001_trimmed.fastq.gz > M4IGRI_10_C_whole.sam
+####merge, sort, mark duplicates
+samtools merge M4IGRI_10_A_whole.sam M4IGRI_10_B_whole.sam M4IGRI_10_C_whole.sam -o M4IGRI_10_merged.bam
+samtools fixmate -m M4IGRI_10_merged.bam M4IGRI_10_merged_fixmate.bam
+samtools sort -O bam -o M4IGRI_10_merged_fixmate_sort.bam M4IGRI_10_merged_fixmate.bam
+samtools markdup M4IGRI_10_merged_fixmate_sort.bam M4IGRI_10_merged_fixmate_sort_MD.bam
+samtools index -c M4IGRI_10_merged_fixmate_sort_MD.bam
+#identify SNPs
+bcftools mpileup --skip-indels --fasta-ref /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta M4IGRI_10_merged_fixmate_sort_MD.bam --min-MQ 30 --annotate AD | bcftools call --consensus-caller --variants-only --output M4IGRI_10.vcf
+####filtering
+#####filtering for homozygosity (1) and read depth (min 10 and max 40)
+awk 'split($10,a,":") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[1], a[2], a[3]}' M4IGRI_10.vcf > M4IGRI_10_filter1.vcf
+awk 'split($13,a,",") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[2]/(a[1]+a[2]), a[2]+a[1]}' M4IGRI_10_filter1.vcf > M4IGRI_10_filter2.vcf
+awk '$11 >= 1  && $12 >= 3 && $12 <= 20 {print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10}' M4IGRI_10_filter2.vcf > M4IGRI_10_filter3.vcf
+#####Add headers to filtered.vcf files 
+grep '^#' M4IGRI_10.vcf | cat - M4IGRI_10_filtered.vcf > tmpfile && mv tmpfile M4IGRI_10_filtered.vcf
+
+###M4IGRI_8
+####pre-processing
+fastp -i 3240821_M4IGRI_8_12_2_A_S7_L001_R1_001.fastq.gz -I 3240821_M4IGRI_8_12_2_A_S7_L001_R2_001.fastq.gz -o 3240821_M4IGRI_8_12_2_A_S7_L001_R1_001_trimmed.fastq.gz -O 3240821_M4IGRI_8_12_2_A_S7_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240829_M4IGRI_8_12_2_B_S8_L001_R1_001.fastq.gz -I 3240829_M4IGRI_8_12_2_B_S8_L001_R2_001.fastq.gz -o 3240829_M4IGRI_8_12_2_B_S8_L001_R1_001_trimmed.fastq.gz -O 3240829_M4IGRI_8_12_2_B_S8_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240837_M4IGRI_8_12_2_C_S9_L001_R1_001.fastq.gz -I 3240837_M4IGRI_8_12_2_C_S9_L001_R2_001.fastq.gz -o 3240837_M4IGRI_8_12_2_C_S9_L001_R1_001_trimmed.fastq.gz -O 3240837_M4IGRI_8_12_2_C_S9_L001_R2_001_trimmed.fastq.gz
+####sequence allignment
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240821_M4IGRI_8_12_2_A_S7_L001_R1_001_trimmed.fastq.gz 3240821_M4IGRI_8_12_2_A_S7_L001_R2_001_trimmed.fastq.gz > M4IGRI_8_A_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240829_M4IGRI_8_12_2_B_S8_L001_R1_001_trimmed.fastq.gz 3240829_M4IGRI_8_12_2_B_S8_L001_R2_001_trimmed.fastq.gz > M4IGRI_8_B_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240837_M4IGRI_8_12_2_C_S9_L001_R1_001_trimmed.fastq.gz 3240837_M4IGRI_8_12_2_C_S9_L001_R2_001_trimmed.fastq.gz > M4IGRI_8_C_whole.sam
+####merge, sort, mark duplicates
+samtools merge M4IGRI_8_A_whole.sam M4IGRI_8_B_whole.sam M4IGRI_8_C_whole.sam -o M4IGRI_8_merged.bam
+samtools fixmate -m M4IGRI_8_merged.bam M4IGRI_8_merged_fixmate.bam
+samtools sort -O bam -o M4IGRI_8_merged_fixmate_sort.bam M4IGRI_8_merged_fixmate.bam
+samtools markdup M4IGRI_8_merged_fixmate_sort.bam M4IGRI_8_merged_fixmate_sort_MD.bam
+samtools index -c M4IGRI_8_merged_fixmate_sort_MD.bam
+####identify SNPs
+bcftools mpileup --skip-indels --fasta-ref /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta M4IGRI_8_merged_fixmate_sort_MD.bam --min-MQ 30 --annotate AD | bcftools call --consensus-caller --variants-only --output M4IGRI_8.vcf
+####filtering
+#####filtering for homozygosity (1) and read depth (min 10 and max 40)
+awk 'split($10,a,":") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[1], a[2], a[3]}' M4IGRI_8.vcf > M4IGRI_8_filter1.vcf
+awk 'split($13,a,",") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[2]/(a[1]+a[2]), a[2]+a[1]}' M4IGRI_8_filter1.vcf > M4IGRI_8_filter2.vcf
+awk '$11 >= 1  && $12 >= 3 && $12 <= 20 {print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10}' M4IGRI_8_filter2.vcf > M4IGRI_8_filter3.vcf
+#####Add headers to filtered.vcf files 
+grep '^#' M4IGRI_8.vcf | cat - M4IGRI_8_filtered.vcf > tmpfile && mv tmpfile M4IGRI_8_filtered.vcf
+
+###M4IGRI_4
+####pre-processing
+fastp -i 3240820_M4IGRI_4_19_A_S4_L001_R1_001.fastq.gz -I 3240820_M4IGRI_4_19_A_S4_L001_R2_001.fastq.gz -o 3240820_M4IGRI_4_19_A_S4_L001_R1_001_trimmed.fastq.gz -O 3240820_M4IGRI_4_19_A_S4_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240828_M4IGRI_4_19_B_S5_L001_R1_001.fastq.gz -I 3240828_M4IGRI_4_19_B_S5_L001_R2_001.fastq.gz -o 3240828_M4IGRI_4_19_B_S5_L001_R1_001_trimmed.fastq.gz -O 3240828_M4IGRI_4_19_B_S5_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240836_M4IGRI_4_10_C_S6_L001_R1_001.fastq.gz -I 3240836_M4IGRI_4_10_C_S6_L001_R2_001.fastq.gz -o 3240836_M4IGRI_4_10_C_S6_L001_R1_001_trimmed.fastq.gz -O 3240836_M4IGRI_4_10_C_S6_L001_R2_001_trimmed.fastq.gz
+####sequence allignment
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240820_M4IGRI_4_19_A_S4_L001_R1_001_trimmed.fastq.gz 3240820_M4IGRI_4_19_A_S4_L001_R2_001_trimmed.fastq.gz > M4IGRI_4_A_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240828_M4IGRI_4_19_B_S5_L001_R1_001_trimmed.fastq.gz 3240828_M4IGRI_4_19_B_S5_L001_R2_001_trimmed.fastq.gz > M4IGRI_4_B_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240836_M4IGRI_4_10_C_S6_L001_R1_001_trimmed.fastq.gz 3240836_M4IGRI_4_10_C_S6_L001_R2_001_trimmed.fastq.gz > M4IGRI_4_C_whole.sam
+####merge, sort, mark duplicates
+samtools merge M4IGRI_4_A_whole.sam M4IGRI_4_B_whole.sam M4IGRI_4_C_whole.sam -o M4IGRI_4_merged.bam
+samtools fixmate -m M4IGRI_4_merged.bam M4IGRI_4_merged_fixmate.bam
+samtools sort -O bam -o M4IGRI_4_merged_fixmate_sort.bam M4IGRI_4_merged_fixmate.bam
+samtools markdup M4IGRI_4_merged_fixmate_sort.bam M4IGRI_4_merged_fixmate_sort_MD.bam
+samtools index -c M4IGRI_4_merged_fixmate_sort_MD.bam
+####identify SNPs
+bcftools mpileup --skip-indels --fasta-ref /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta M4IGRI_4_merged_fixmate_sort_MD.bam --min-MQ 30 --annotate AD | bcftools call --consensus-caller --variants-only --output M4IGRI_4.vcf
+####filtering
+#####filtering for homozygosity (1) and read depth (min 10 and max 40)
+awk 'split($10,a,":") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[1], a[2], a[3]}' M4IGRI_4.vcf > M4IGRI_4_filter1.vcf
+awk 'split($13,a,",") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[2]/(a[1]+a[2]), a[2]+a[1]}' M4IGRI_4_filter1.vcf > M4IGRI_4_filter2.vcf
+awk '$11 >= 1  && $12 >= 3 && $12 <= 20 {print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10}' M4IGRI_4_filter2.vcf > M4IGRI_4_filter3.vcf
+#####Add headers to filtered.vcf files 
+grep '^#' M4IGRI_4.vcf | cat - M4IGRI_4_filtered.vcf > tmpfile && mv tmpfile M4IGRI_4_filtered.vcf
+
+###M4IGRI_3
+####pre-processing
+fastp -i 3240819_M3IGRI_3_17_1_A_S1_L001_R1_001.fastq.gz -I 3240819_M3IGRI_3_17_1_A_S1_L001_R2_001.fastq.gz -o 3240819_M3IGRI_3_17_1_A_S1_L001_R1_001_trimmed.fastq.gz -O 3240819_M3IGRI_3_17_1_A_S1_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240827_M3IGRI_3_17_1_B_S2_L001_R1_001.fastq.gz -I 3240827_M3IGRI_3_17_1_B_S2_L001_R2_001.fastq.gz -o 3240827_M3IGRI_3_17_1_B_S2_L001_R1_001_trimmed.fastq.gz -O 3240827_M3IGRI_3_17_1_B_S2_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240835_M3IGRI_3_17_1_C_S3_L001_R1_001.fastq.gz -I 3240835_M3IGRI_3_17_1_C_S3_L001_R2_001.fastq.gz -o 3240835_M3IGRI_3_17_1_C_S3_L001_R1_001_trimmed.fastq.gz -O 3240835_M3IGRI_3_17_1_C_S3_L001_R2_001_trimmed.fastq.gz
+####sequence allignment
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240819_M3IGRI_3_17_1_A_S1_L001_R1_001_trimmed.fastq.gz 3240819_M3IGRI_3_17_1_A_S1_L001_R2_001_trimmed.fastq.gz > M3IGRI_3_A_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240827_M3IGRI_3_17_1_B_S2_L001_R1_001_trimmed.fastq.gz 3240827_M3IGRI_3_17_1_B_S2_L001_R2_001_trimmed.fastq.gz > M3IGRI_3_B_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240835_M3IGRI_3_17_1_C_S3_L001_R1_001_trimmed.fastq.gz 3240835_M3IGRI_3_17_1_C_S3_L001_R2_001_trimmed.fastq.gz > M3IGRI_3_C_whole.sam
+####merge, sort, mark duplicates
+samtools merge M3IGRI_3_A_whole.sam M3IGRI_3_B_whole.sam M3IGRI_3_C_whole.sam -o M3IGRI_3_merged.bam
+samtools fixmate -m M3IGRI_3_merged.bam M3IGRI_3_merged_fixmate.bam
+samtools sort -O bam -o M3IGRI_3_merged_fixmate_sort.bam M3IGRI_3_merged_fixmate.bam
+samtools markdup M3IGRI_3_merged_fixmate_sort.bam M3IGRI_3_merged_fixmate_sort_MD.bam
+samtools index -c M3IGRI_3_merged_fixmate_sort_MD.bam
+####identify SNPs
+bcftools mpileup --skip-indels --fasta-ref /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta M3IGRI_3_merged_fixmate_sort_MD.bam --min-MQ 30 --annotate AD | bcftools call --consensus-caller --variants-only --output M3IGRI_3.vcf
+####filtering
+#####filtering for homozygosity (1) and read depth (min 10 and max 40)
+awk 'split($10,a,":") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[1], a[2], a[3]}' M3IGRI_3.vcf > M3IGRI_3_filter1.vcf
+awk 'split($13,a,",") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[2]/(a[1]+a[2]), a[2]+a[1]}' M3IGRI_3_filter1.vcf > M3IGRI_3_filter2.vcf
+awk '$11 >= 1  && $12 >= 3 && $12 <= 20 {print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10}' M3IGRI_3_filter2.vcf > M3IGRI_3_filter3.vcf
+#####Add headers to filtered.vcf files 
+grep '^#' M3IGRI_3.vcf| cat - M3IGRI_3_filtered.vcf > tmpfile && mv tmpfile M3IGRI_3_filtered.vcf
+
+###I-28216
+####pre-processing
+fastp -i 3240824_I28216_2_1_A_S16_L001_R1_001.fastq.gz -I 3240824_I28216_2_1_A_S16_L001_R2_001.fastq.gz -o 3240824_I28216_2_1_A_S16_L001_R1_001_trimmed.fastq.gz -O 3240824_I28216_2_1_A_S16_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240832_I28216_2_1_B_S17_L001_R1_001.fastq.gz -I 3240832_I28216_2_1_B_S17_L001_R2_001.fastq.gz -o 3240832_I28216_2_1_B_S17_L001_R1_001_trimmed.fastq.gz -O 3240832_I28216_2_1_B_S17_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240840_I28216_2_1_C_S18_L001_R1_001.fastq.gz -I 3240840_I28216_2_1_C_S18_L001_R2_001.fastq.gz -o 3240840_I28216_2_1_C_S18_L001_R1_001_trimmed.fastq.gz -O 3240840_I28216_2_1_C_S18_L001_R2_001_trimmed.fastq.gz
+####sequence allignment
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240824_I28216_2_1_A_S16_L001_R1_001_trimmed.fastq.gz 3240824_I28216_2_1_A_S16_L001_R2_001_trimmed.fastq.gz > I28216_A_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240832_I28216_2_1_B_S17_L001_R1_001_trimmed.fastq.gz 3240832_I28216_2_1_B_S17_L001_R2_001_trimmed.fastq.gz > I28216_B_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240840_I28216_2_1_C_S18_L001_R1_001_trimmed.fastq.gz 3240840_I28216_2_1_C_S18_L001_R2_001_trimmed.fastq.gz > I28216_C_whole.sam
+####merge, sort, mark duplicates
+samtools merge I28216_A_whole.sam I28216_B_whole.sam I28216_C_whole.sam -o I28216_merged.bam
+samtools fixmate -m I28216_merged.bam I28216_merged_fixmate.bam
+samtools sort -O bam -o I28216_merged_fixmate_sort.bam I28216_merged_fixmate.bam
+samtools markdup I28216_merged_fixmate_sort.bam I28216_merged_fixmate_sort_MD.bam
+samtools index -c I28216_merged_fixmate_sort_MD.bam
+####identify SNPs
+bcftools mpileup --skip-indels --fasta-ref /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta I28216_merged_fixmate_sort_MD.bam --min-MQ 30 --annotate AD | bcftools call --consensus-caller --variants-only --output I28216.vcf
+####filtering
+#####filtering for homozygosity (1) and read depth (min 10 and max 40)
+awk 'split($10,a,":") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[1], a[2], a[3]}' I28216.vcf > I28216_filter1.vcf
+awk 'split($13,a,",") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[2]/(a[1]+a[2]), a[2]+a[1]}' I28216_filter1.vcf > I28216_filter2.vcf
+awk '$11 >= 1  && $12 >= 3 && $12 <= 20 {print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10}' I28216_filter2.vcf > I28216_filter3.vcf
+
+#####Add headers to filtered.vcf files 
+grep '^#' I28216.vcf | cat - I28216_filtered.vcf > tmpfile && mv tmpfile I28216_filtered.vcf
+
+###I-2068
+####pre-processing
+fastp -i 3240825_I20681_1_1_A_S19_L001_R1_001.fastq.gz -I 3240825_I20681_1_1_A_S19_L001_R2_001.fastq.gz -o 3240825_I20681_1_1_A_S19_L001_R1_001_trimmed.fastq.gz -O 3240825_I20681_1_1_A_S19_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240833_I20681_1_1_B_S20_L001_R1_001.fastq.gz -I 3240833_I20681_1_1_B_S20_L001_R2_001.fastq.gz -o 3240833_I20681_1_1_B_S20_L001_R1_001_trimmed.fastq.gz -O 3240833_I20681_1_1_B_S20_L001_R2_001_trimmed.fastq.gz
+fastp -i 3240841_I20681_1_1_C_S21_L001_R1_001.fastq.gz -I 3240841_I20681_1_1_C_S21_L001_R2_001.fastq.gz -o 3240841_I20681_1_1_C_S21_L001_R1_001_trimmed.fastq.gz -O 3240841_I20681_1_1_C_S21_L001_R2_001_trimmed.fastq.gz
+####sequence allignment
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240825_I20681_1_1_A_S19_L001_R1_001_trimmed.fastq.gz 3240825_I20681_1_1_A_S19_L001_R2_001_trimmed.fastq.gz > I2068_A_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240833_I20681_1_1_B_S20_L001_R1_001_trimmed.fastq.gz 3240833_I20681_1_1_B_S20_L001_R2_001_trimmed.fastq.gz > I2068_B_whole.sam
+bwa mem -t 50 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta 3240841_I20681_1_1_C_S21_L001_R1_001_trimmed.fastq.gz 3240841_I20681_1_1_C_S21_L001_R2_001_trimmed.fastq.gz > I2068_C_whole.sam
+####merge, sort, mark duplicates
+samtools merge I2068_A_whole.sam I2068_B_whole.sam I2068_C_whole.sam -o I2068_merged.bam
+samtools fixmate -m I2068_merged.bam I2068_merged_fixmate.bam
+samtools sort -O bam -o I2068_merged_fixmate_sort.bam I2068_merged_fixmate.bam
+samtools markdup I2068_merged_fixmate_sort.bam I2068_merged_fixmate_sort_MD.bam
+samtools index -c I2068_merged_fixmate_sort_MD.bam
+####identify SNPs
+bcftools mpileup --skip-indels --fasta-ref /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta I2068_merged_fixmate_sort_MD.bam --min-MQ 30 --annotate AD | bcftools call --consensus-caller --variants-only --output I2068.vcf
+####filtering
+#####filtering for homozygosity (1) and read depth (min 10 and max 40)
+awk 'split($10,a,":") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[1], a[2], a[3]}' I2068.vcf > I2068_filter1.vcf
+awk 'split($13,a,",") {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10, a[2]/(a[1]+a[2]), a[2]+a[1]}' I2068_filter1.vcf > I2068_filter2.vcf
+awk '$11 >= 1  && $12 >= 3 && $12 <= 20 {print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10}' I2068_filter2.vcf > I2068_filter3.vcf
+#####Add headers to filtered.vcf files 
+grep '^#' I2068.vcf | cat - I2068_filtered.vcf > tmpfile && mv tmpfile I2068_filtered.vcf
+
+###quality control
+fastqc *.fastq.gz
+###count reads
+for i in *.seq/*fastq.gz; do
+ name=`basename $i | cut -d . -f 1`
+ count=`zcat $i | wc -l`
+ echo $name $count
+done > fastq_line_counts.txt
+
+cat fastq_line_counts.txt | awk '{print $1,$2/4}' | sort -nk 2 > fastq_read_counts.txt
+
+###count mapping rate
+for i in *.seq/*sam; do
+ name=`basename $i | cut -d . -f 1`
+ count=`samtools view -cq 20 $i`
+ echo $name $count
+done > mapped_reads.txt
+##filtering identical markers between M4IGRI_11, I28216, M3IGRI_3, M4IGRI_4, M4IGRI_8, M4IGRI_10, I2068, Alraune
+##zip and index files
+bgzip M4IGRI_11_filtered.vcf
+bgzip I28216_filtered.vcf
+bgzip M3IGRI_3_filtered.vcf 
+bgzip M4IGRI_4_filtered.vcf
+bgzip M4IGRI_8_filtered.vcf
+bgzip M4IGRI_10_filtered.vcf
+bgzip I2068_filtered.vcf
+bgzip Alraune_filter3.vcf
+
+bcftools index M4IGRI_11_filtered.vcf.gz
+bcftools index I28216_filtered.vcf.gz
+bcftools index M3IGRI_3_filtered.vcf.gz
+bcftools index M4IGRI_4_filtered.vcf.gz
+bcftools index M4IGRI_8_filtered.vcf.gz
+bcftools index M4IGRI_10_filtered.vcf.gz
+bcftools index I2068_filtered.vcf
+bcftools index Alraune_filter3.vcf
+
+##merge all .vcf.gz files
+bcftools merge M4IGRI_11_filtered.vcf.gz I2068_filtered.vcf.gz I28216_filtered.vcf.gz M3IGRI_3_filtered.vcf.gz M4IGRI_4_filtered.vcf.gz M4IGRI_8_filtered.vcf.gz M4IGRI_10_filtered.vcf.gz Alraune_filter3.vcf.gz -o merged_output.vcf.gz 
+gunzip merged_output.vcf.gz
+
+## remove all SNPs in Alraune
+awk -F'\t' '!($5 ~ /,/) {print}' merged_output.vcf > merged_output _2.vcf
+awk -F'\t' '$17 == "./.:.:." && $15 == "./.:.:." && $14 == "./.:.:." && $13 == "./.:.:." && $12 == "./.:.:." && $11 == "./.:.:." && $10 != "./.:.:." ' merged_output _2.vcf > M4IGRI_11_filtered_output.txt
+grep '^#' merged_output.vcf | cat - M4IGRI_11_filtered_output.txt > tmpfile && mv tmpfile M4IGRI_11_filtered_output.txt
+
+awk -F'\t' '$17 == "./.:.:." && $10 != "./.:.:." ' merged_output _2.vcf > all_woAlraune_filtered_output.txt
+
+grep '^#' merged_output.vcf | cat - all_woAlraune_filtered_output.txt > tmpfile && mv tmpfile all_woAlraune_filtered_output.txt
+##look for variants in 365 bp region
+
+awk '$1=="chr3H" && $2>83769689 && $2<449835334' M4IGRI_11_filtered_output.txt > M4IGRI_11_filtered_output_region.txt
+grep '^#' merged_output.vcf | cat - M4IGRI_11_filtered_output.txt > tmpfile && mv tmpfile M4IGRI_11_filtered_output.txt
+###VEP
+vep -i M4IGRI_11_filtered_output_region.txt --gff /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/Igri_annotated/Igri.gff.gz --fasta /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta -o M4IGRI_11_filtered_output_region
+###bedtools
+/opt/Bio/bedtools/2.30.0/bin/bedtools intersect -a M4IGRI_11_filtered_output_region.txt -b /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/Igri_annotated/Igri.gff -wa -wb > M4IGRI_11_filtered_output_region_annotation_result.txt
+
+##extract genes with medium to large-effect SNPs
+samtools faidx /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta chr3H:136768045-136774453 > gene1_extracted_sequence.fa
+samtools faidx /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta chr3H:148173476-148174249 > gene2_extracted_sequence.fa
+samtools faidx /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta chr3H:277322366-277351546 > gene3_extracted_sequence.fa
+#Further analysis in R-studio
+##load libraries and files
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+library(matrixStats)
+library(tidyr)
+
+M4IGRI_11_filtered <- read.delim("~/Zsa_Zsa/Master/Semester 5/grün - Masterarbeit/R_at_home/M4IGRI_11_filtered_output.txt", header=T, comment.char="#")
+filtered_output <- read.delim("~/Zsa_Zsa/Master/Semester 5/grün - Masterarbeit/R_at_home/all_woAlraune_filtered_output.txt", header=T, comment.char="#")
+##WGS marker density along the chromosomes
+filtered_output$POS_Mbp <- filtered_output$POS/1000000
+M4IGRI_11_filtered$POS_Mbp <- M4IGRI_11_filtered$POS/1000000
+oM4IGRI_11 <- M4IGRI_11_filtered[(grepl("./.:.:.", M4IGRI_11_filtered$I.2068_1_1_1)),]
+oM4IGRI_11$POS_Mbp <- oM4IGRI_11$POS/1000000
+my_colors <- c("darkred", "darkred", "darkred", "darkred", "darkred", "darkred","darkred")
+###density plot M4IGRI_11 only shared with Alraune removed
+snp_data_all<- all[,c(1,18)]
+bin_width=1
+snp_data_all$BIN <- cut(snp_data_all$POS_Mbp, breaks = seq(0, max(snp_data_all$POS_Mbp) + bin_width, bin_width), include.lowest = TRUE, labels = FALSE)
+all <- filtered_output[!(grepl("contig", filtered_output$CHROM)), ]
+chromosome_counts_all <- table(all$CHROM)
+barplot(chromosome_counts_all, 
+        main = "Number of SNPs per Chromosome M4IGRI_11_11", 
+        xlab = "Chromosome", 
+        ylab = "Count", 
+        col = "darkred",
+        cex.axis = 3.0,
+        cex.lab = 3.0,
+        cex.names = 3.0)
+###density plot only M4IGRI_11
+M4IGRI_11_data <- oM4IGRI_11[!(grepl("contig", oM4IGRI_11$CHROM)), ]
+snp_data_after <- M4IGRI_11_data[,c(1,18)]
+bin_width=1
+snp_data_after$BIN <- cut(snp_data_after$POS_Mbp, breaks = seq(0, max(snp_data_after$POS_Mbp) + bin_width, bin_width), include.lowest = TRUE, labels = FALSE)
+ggplot(snp_data_after, aes(x = POS_Mbp, fill = CHROM)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = my_colors) +  # Specify the custom colors
+  labs(title = "EMS SNPs Along Each Chromosome in M4IGRI_11_11", x = "Positions along the chromosomes [Mbp]", y = "Density") +
+  theme_minimal() +
+  theme(text = element_text(size = 15)) +
+  facet_grid(cols = vars(CHROM), scales = "fixed", space = "free_y")
+###SNPs per chromosome
+chromosome_counts_M4IGRI_11 <- table(M4IGRI_11_data$CHROM)
+barplot(chromosome_counts_M4IGRI_11, 
+        main = "Number of SNPs per Chromosome M4IGRI_11_11", 
+        xlab = "Chromosome", 
+        ylab = "Count", 
+        col = "darkred",
+        cex.axis = 3.0,
+        cex.lab = 3.0,
+        cex.names = 3.0)
+chromosome_counts_M4IGRI_11
+## selection for KASP assay
+only_GC_AT <- subset(M4IGRI_11_filtered, (REF == "G" & ALT == "A") | (REF == "C" & ALT == "T"))
+only_GC_AT_chr3H <- only_GC_AT %>%
+  filter(`#CHROM` == "chr3H" & POS >= 23359434 & POS <= 463948923)
+total_snps <- nrow(only_GC_AT_chr3H)
+interval <- ceiling(45)
+evenly_distributed_snps <- only_GC_AT_chr3H[c(seq(1,total_snps, by = interval)),]
+print(evenly_distributed_snps)
+#KASP marker
+awk 'BEGIN{OFS="\t"} {print $1, $2 - 50, $2 + 50}' selected_snps_for_kasp.txt > snps_kasp.bed
+/opt/Bio/bedtools/2.30.0/bin/bedtools getfasta -fi /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta  -bed snps_kasp.bed -fo snp_sequences_kasp.fa
+
+awk 'BEGIN {OFS=""} {if (NR%2==0) {split($1, bases, ""); bases[50] = "[" bases[50] "/" $4 "]"; print substr($0, 1, 49) bases[50] substr($0, 51)} else print $0}' snp_sequences.fa > snp_sequences_formatted.fa
+bwa mem -k 5 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta kasp_sequences_kasp.fa > kasp.sam
+awk 'BEGIN{OFS="\t"} {print $1, $2 - 50, $2 + 50}' SNPs_chr3H.txt > chr3H_possible_kasp.bed
+/opt/Bio/bedtools/2.30.0/bin/bedtools getfasta -fi /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta  -bed chr3H_posible_kasp.bed  -fo chr3H_possible_kasp_sequences.fa
+bwa mem -k 5 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta chr3H_possible_kasp_sequences.fa > chr3H_posible_kasp.sam
+#get sequences of selected SNPs
+awk 'BEGIN{OFS="\t"} {print $1, $2 - 50, $2 + 50}' selected_snps_for_kasp_final.txt > selected_snps_for_kasp_final.bed
+/opt/Bio/bedtools/2.30.0/bin/bedtools getfasta -fi /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta  -bed selected_snps_for_kasp_final.bed  -fo snp_sequences_formatted_final.fa
+bwa mem -k 5 /filer-5/agruppen/GGR/boyny/data_analysis/pendant_awn/WGS/reference/220810_Igri_pseudomolecules_and_unplaced_contigs_CPclean.fasta snp_sequences_formatted_final.fa > kasp_final.sam
+awk 'BEGIN {OFS=""} {if (NR%2==0) {split($1, bases, ""); bases[50] = "[" bases[50] "/" $4 "]"; print substr($0, 1, 49) bases[50] substr($0, 51)} else print $0}' snp_sequences_final.fa > snp_sequences_formatted_final.fa
+#check if there are other SNPs in the sequence
+bedtools intersect -a selected_snps_for_kasp_final.bed -b M4IGRI_11_filter3.vcf -wa -wb > intersected_snps.bed 
+
